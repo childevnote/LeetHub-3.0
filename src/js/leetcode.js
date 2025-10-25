@@ -30,6 +30,7 @@ function getLeetCodeBaseUrl() {
   const hostname = window.location.hostname;
   return `https://${hostname.includes('leetcode.cn') ? 'leetcode.cn' : 'leetcode.com'}`;
 }
+
 /* Enum for languages supported by LeetCode. */
 const languages = {
   C: '.c',
@@ -61,13 +62,20 @@ const languages = {
   TypeScript: '.ts',
 };
 
-/* Commit messages */
-const readmeMsg = 'Create README - LeetHub';
-const discussionMsg = 'Prepend discussion post - LeetHub';
-const createNotesMsg = 'Attach NOTES - LeetHub';
+// Repo readme section markers for adding problems topic wise
+const leetCodeSectionStart = `<!---LeetCode Topics Start-->`;
+const leetCodeSectionHeader = `# LeetCode Topics`;
+const leetCodeSectionEnd = `<!---LeetCode Topics End-->`;
+const readmeFilename = 'README.md';
+const defaultRepoReadme = "Contains topicwise list of solved problems.\n\n";
+
+// SubFolder
+const basePath = 'LeetCode';
 
 /* Difficulty of most recenty submitted question */
 let difficulty = '';
+/* Difficulty of most recenty submitted question */
+let last_language = '';
 
 /* state of upload for progress */
 let uploadState = { uploading: false };
@@ -112,6 +120,7 @@ function getLanguageFromExtension(extension) {
  * Constructs the full GitHub API URL to upload a file to a specific path in the repository.
  *
  * @param {string} hook - GitHub repository path in the format "username/repo".
+ * @param {string} basePath - Base folder path where the file will be uploaded (e.g., "algorithm/LeetCode").
  * @param {string} difficulty - Problem difficulty (e.g., "Easy", "Medium", "Hard").
  * @param {string} problem - Problem slug or directory name (e.g., "0001-two-sum").
  * @param {string} filename - Name of the file to upload (e.g., "0001-two-sum.js").
@@ -122,28 +131,27 @@ function getLanguageFromExtension(extension) {
 
 function constructGitHubPath(
   hook,
+  basePath,
   difficulty,
   problem,
   filename,
   useDifficultyFolder,
   useLanguageFolder = false,
 ) {
+  const filePath = problem ? `${problem}/${filename}` : `${filename}`;
   if (useLanguageFolder) {
-    //split the filename to get the extension
-    const fileExtension = filename.split('.').pop();
-    //get the language from the extension
-    const language = getLanguageFromExtension(`.${fileExtension}`);
+    const language = last_language;
     console.log('Language:', language);
     if (language) {
       const path = useDifficultyFolder
-        ? `${language}/${difficulty}/${problem}/${filename}`
-        : `/${language}/${problem}/${filename}`;
+        ? `${language}/${difficulty}/${filePath}`
+        : `${language}/${filePath}`;
       return `https://api.github.com/repos/${hook}/contents/${path}`;
     }
   }
   const path = useDifficultyFolder
-    ? `${difficulty}/${problem}/${filename}`
-    : `${problem}/${filename}`;
+    ? `${basePath}/${difficulty}/${filePath}`
+    : `${filePath}`;
   return `https://api.github.com/repos/${hook}/contents/${path}`;
 }
 
@@ -172,6 +180,113 @@ const getCustomCommitMessage = problemContext => {
   });
 };
 
+/**
+ * Appends a problem to the README file for a specific topic.
+ * Creates a new topic if it doesn't exist. Creates a new README.md if it doesn't exist.
+ *
+ * @param {Array} topicTags - The topic tags in which the @p problemName is to be added.
+ * @param {string} problemName - The name of the problem to be added.
+ */
+async function updateReadmeTopicTagsWithProblem(topicTags, problemName) {
+  if (!topicTags) {
+    console.log('No topic tags provided');
+    return;
+  }
+
+  const { leethub_token, leethub_hook, stats } = await chrome.storage.local.get([
+    'leethub_token',
+    'leethub_hook',
+    'stats',
+  ]);
+
+  let readme = '';
+  let newSha = '';
+
+  try {
+    const { content, sha } = await getUpdatedData(
+      leethub_token,
+      leethub_hook,
+      '',
+      readmeFilename,
+      false
+    );
+    newSha = sha;
+    readme = decodeURIComponent(escape(atob(content)));
+    stats.shas[readmeFilename] = { '': sha };
+    await chrome.storage.local.set({ stats });
+  } catch (err) {
+    if (err.message === '404') {
+      const initialContent = btoa(unescape(encodeURIComponent(defaultRepoReadme)));
+      const uploadResponse = await upload(
+        leethub_token,
+        leethub_hook,
+        initialContent,
+        '',
+        readmeFilename,
+        null,
+        'Initialize README.md',
+        undefined,
+        false
+      );
+      newSha = uploadResponse.content.sha;
+      readme = defaultRepoReadme;
+
+      stats.shas[readmeFilename] = { '': newSha };
+      await chrome.storage.local.set({ stats });
+    } else {
+      console.log(`Error fetching README: ${err.message}`);
+      return;
+    }
+  }
+
+  for (const topic of topicTags) {
+    readme = await appendProblemToReadme(topic.name, readme, leethub_hook, problemName);
+  }
+
+  readme = sortTopicsInReadme(readme);
+
+  const encodedReadme = btoa(unescape(encodeURIComponent(readme)));
+  try {
+    return await upload(
+      leethub_token,
+      leethub_hook,
+      encodedReadme,
+      '',
+      readmeFilename,
+      newSha,
+      `Add ${problemName} to topics.`,
+      undefined,
+      false
+    );
+  } catch (err) {
+    if (err.message === '409') {
+      // Handle 409 Conflict by fetching the latest SHA and retrying
+      console.log(`Conflict detected for ${readmeFilename}. Fetching latest SHA...`);
+      const { sha: latestSha } = await getUpdatedData(
+        leethub_token,
+        leethub_hook,
+        '',
+        readmeFilename,
+        false
+      );
+      return upload(
+        leethub_token,
+        leethub_hook,
+        encodedReadme,
+        '',
+        readmeFilename,
+        latestSha,
+        `Add ${problemName} to topics.`,
+        undefined,
+        false
+      );
+    } else {
+        console.log(`Error updating README: ${err.message}`);
+        return;
+    }
+  }
+}
+
 /* Main function for uploading code to GitHub repo, and callback cb is called if success */
 const upload = (
   token,
@@ -188,6 +303,7 @@ const upload = (
   // const URL = `https://api.github.com/repos/${hook}/contents/${problem}/${filename}`;
   const URL = constructGitHubPath(
     hook,
+    basePath,
     difficulty,
     problem,
     filename,
@@ -218,9 +334,8 @@ const upload = (
     .then(res => {
       if (res.status === 200 || res.status === 201) {
         return res.json();
-      } else if (res.status === 409) {
-        throw new Error('409');
       }
+      throw new Error(res.status);
     })
     .then(async body => {
       updatedSha = body.content.sha; // get updated SHA.
@@ -445,6 +560,7 @@ async function getUpdatedData(
 ) {
   const URL = constructGitHubPath(
     hook,
+    basePath,
     difficulty,
     problem,
     filename,
@@ -460,12 +576,18 @@ async function getUpdatedData(
     },
   };
 
-  return fetch(URL, options).then(res => {
+return fetch(URL, options)
+  .then(res => {
     if (res.status === 200 || res.status === 201) {
       return res.json();
     } else {
-      throw new Error('' + res.status);
+      console.log(`Fetch failed with status: ${res.status}`);
+      return {};
     }
+  })
+  .catch(err => {
+    console.log(`Fetch error: ${err.message}`);
+    return {};
   });
 }
 
@@ -596,7 +718,7 @@ document.addEventListener('click', event => {
         const addition = `[Discussion Post (created on ${currentDate})](${window.location})  \n`;
         const problemName = window.location.pathname.split('/')[2]; // must be true.
 
-        uploadGit(addition, problemName, 'README.md', discussionMsg, 'update', true);
+        uploadGit(addition, problemName, 'README.md', `Prepend discussion post: ${problemName}`, 'update', true);
       }
     }, 1000);
   }
@@ -713,6 +835,21 @@ LeetCodeV1.prototype.getLanguageExtension = function () {
     }
   }
   return null;
+};
+LeetCodeV1.prototype.getLanguage = function () {
+  const tag = [
+    ...document.getElementsByClassName('ant-select-selection-selected-value'),
+    ...document.getElementsByClassName('Select-value-label'),
+  ];
+  if (tag && tag.length > 0) {
+    for (let i = 0; i < tag.length; i += 1) {
+      const elem = tag[i].textContent;
+      if (elem !== undefined && languages[elem] !== undefined) {
+        return elem;
+      }
+    }
+  }
+  return '';
 };
 /* function to get the notes if there is any
  the note should be opened atleast once for this to work
@@ -1043,7 +1180,6 @@ query submissionDetails($submissionId: ID!) {
     variables: { submissionId: submissionId },
     operationName: 'submissionDetails',
   };
-  console.info('LeetHub:', { submissionDetailsQuery });
   const submissionDetailsOptions = {
     method: 'POST',
     headers: {
@@ -1133,6 +1269,12 @@ LeetCodeV2.prototype.getLanguageExtension = function () {
   }
 
   return languages[lang];
+};
+LeetCodeV2.prototype.getLanguage = function () {
+  if (this.submissionData != null) {
+    return this.submissionData.lang.verboseName;
+  }
+  return '';
 };
 
 LeetCodeV2.prototype.getNotesIfAny = function () {};
@@ -1416,7 +1558,8 @@ const loader = (leetCode, suffix) => {
       if (!language) {
         throw new Error('Could not find language');
       }
-
+      last_language = leetCode.getLanguage();
+      
       /* Upload README */
       const updateReadMe = await chrome.storage.local.get('stats').then(({ stats }) => {
         const shaExists = stats?.shas?.[problemName]?.['README.md'] !== undefined;
@@ -1426,7 +1569,7 @@ const loader = (leetCode, suffix) => {
             btoa(unescape(encodeURIComponent(probStatement))),
             problemName,
             'README.md',
-            readmeMsg,
+            `Create readme : ${problemName}`,
             'upload',
             false,
           );
@@ -1441,7 +1584,7 @@ const loader = (leetCode, suffix) => {
           btoa(unescape(encodeURIComponent(notes))),
           problemName,
           'NOTES.md',
-          createNotesMsg,
+          `Attach Notes : ${problemName}`,
           'upload',
           false,
         );
@@ -1475,7 +1618,13 @@ const loader = (leetCode, suffix) => {
       /* Upload code to Git */
       const updateCode = leetCode.findAndUploadCode(problemName, fileName, commitMsg, 'upload');
 
-      await Promise.all([updateReadMe, updateNotes, updateCode]);
+      /* Group problem into its relevant topics */
+      const updateRepoReadMe = updateReadmeTopicTagsWithProblem(
+        leetCode.submissionData?.question?.topicTags,
+        problemName
+      );
+
+      await Promise.all([updateReadMe, updateNotes, updateCode, updateRepoReadMe]);
 
       uploadState.uploading = false;
       leetCode.markUploaded();
@@ -1487,7 +1636,7 @@ const loader = (leetCode, suffix) => {
       uploadState.uploading = false;
       leetCode.markUploadFailed();
       clearInterval(intervalId);
-      console.error(err);
+      console.log(err);
     }
   }, 1000);
 };
